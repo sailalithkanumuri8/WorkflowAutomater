@@ -3,127 +3,203 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 import time
+from urllib.parse import urlparse
+import csv
+from simple_salesforce import Salesforce
+import os
+from dotenv import load_dotenv
 
-# Set your OpenAI API key
-openai.api_key = "sk-proj-FTTMB7yUuGY23El1xv4YT3BlbkFJgfs6YoYZsILqFVUQlkyJ"
-
+load_dotenv()
+openai.api_key = os.getenv('OPEN_AI_API_KEY')
 
 def fetch_website_text(url):
     try:
-        response = requests.get(url, timeout=10)
+        response = requests.get(url, timeout=15)
         soup = BeautifulSoup(response.text, 'html.parser')
-        for script in soup(["script", "style"]):
-            script.extract()
-        text = soup.get_text(separator=' ')
-        return ' '.join(text.split())[:8000]  # Trim to 8K characters
+
+        for element in soup(["script", "style", "nav", "footer"]):
+            element.decompose()
+
+        text = soup.get_text(separator=' ', strip=True)
+        return ' '.join(text.split())[:8000]
     except Exception as e:
         return f"Error: {str(e)}"
 
 
 def get_industry_info(website_text):
-    prompt = f"""
-You are a business classification assistant. Based on the website content below, identify the following:
+    prompt = f"""Analyze this website content and return:
+    1. Primary industry
+    2. Business sector
+    3. Specific subsector
 
-1. Industry
-2. Sector
-3. Subsector
+    Format strictly as:
+    Industry: [value]
+    Sector: [value]
+    Subsector: [value]
 
-Format the output exactly like this:
-Industry: ...
-Sector: ...
-Subsector: ...
-
-Website content:
-\"\"\"
-{website_text}
-\"\"\"
-"""
+    Content: {website_text[:6000]}"""
 
     try:
         response = openai.ChatCompletion.create(
-            model="gpt-4o",
+            model="gpt-4",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2
         )
         return response.choices[0].message["content"].strip()
     except Exception as e:
-        return f"Error: {str(e)}"
+        return f"API Error: {str(e)}"
 
 
-def update_csv_with_industry_info(file_path):
-    # Skip the first 5 rows which contain metadata
-    # Look for the actual header row that contains "Company", "Tier", etc.
-    header_row = None
+def determine_investment_tier(industry_data, website_text):
+    prompt = f"""Evaluate this company's investment potential using:
+    - Industry: {industry_data.get('Industry', 'N/A')}
+    - Sector: {industry_data.get('Sector', 'N/A')}
+    - Sub Sector: {industry_data.get('Sub Sector', 'N/A')}
+    - Company Profile: {website_text[:3000]}
 
+    Assessment Criteria:
+    1. Market Growth (High/Medium/Low)
+    2. Competitive Position (Leader/Established/Niche)
+    3. Regulatory Risk (Low/Medium/High)
+    4. Tech Advantage (Strong/Moderate/Weak)
+
+    Return ONLY the tier number (1, 2, or 3) based on:
+    1 = Strong potential
+    2 = Moderate potential
+    3 = High risk"""
+
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-4",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1
+        )
+        return response.choices[0].message["content"].strip()
+    except Exception as e:
+        print(f"Tier API Error: {str(e)}")
+        return "Error"
+
+
+def process_company_data(row):
+    result = {'Industry': None, 'Sector': None, 'Sub Sector': None, 'Tier': None}
+    try:
+        website_text = fetch_website_text(row['Website'])
+        print(f"Fetched website text for {row['Website']}: {website_text[:100]}...")
+
+        if pd.isna(row['Industry']):
+            industry_response = get_industry_info(website_text)
+            print(f"Industry response: {industry_response}")
+
+            if "Industry:" in industry_response:
+                for line in industry_response.split('\n'):
+                    if 'Industry:' in line:
+                        result['Industry'] = line.split(': ')[1].strip()
+                    elif 'Sector:' in line:
+                        result['Sector'] = line.split(': ')[1].strip()
+                    elif 'Sub Sector:' in line:
+                        result['Sub Sector'] = line.split(': ')[1].strip()
+
+        if pd.isna(row['Tier']) or str(row['Tier']) not in {'1', '2', '3'}:
+            industry_data = {
+                'Industry': result['Industry'] or row['Industry'],
+                'Sector': result['Sector'] or row['Sector'],
+                'Sub Sector': result['Sub Sector'] or row['Sub Sector']
+            }
+            tier = determine_investment_tier(industry_data, website_text)
+            print(f"Tier response: {tier}")
+            result['Tier'] = tier if tier in {'1', '2', '3'} else '3'  # Default to 3 on errors
+
+    except Exception as e:
+        print(f"Processing error for {row['Website']}: {str(e)}")
+
+    return result
+
+
+def update_csv_with_industry_info(file_path, target_companies):
+    header_row = 0
     with open(file_path, 'r', encoding='latin1') as f:
         for i, line in enumerate(f):
-            if "Company,Tier,Industry,Sector,Sub-Sector" in line:
+            if "Company Name" in line and ("Tier" in line) and ("Industry" in line):
                 header_row = i
                 break
 
-    if header_row is None:
-        print("Could not find the header row in the file")
-        return
-
-    # Read the CSV file starting from the header row
     df = pd.read_csv(file_path, skiprows=header_row, encoding='latin1')
-
-    # Print the first few rows to verify
-    print("First few rows of the dataframe:")
-    print(df.head())
-
-    # Clean up column names (remove whitespace)
     df.columns = [col.strip() for col in df.columns]
 
-    # Create a new output dataframe with only the columns we need
-    output_df = pd.DataFrame()
+    print("Columns in DataFrame:", df.columns.tolist())
 
-    # Map the important columns
-    important_columns = ['Company', 'URL', 'Industry', 'Sector', 'Sub-Sector']
-    for col in important_columns:
-        if col in df.columns:
-            output_df[col] = df[col]
-        else:
-            print(f"Warning: Column '{col}' not found in the dataframe")
-            output_df[col] = None
+    if 'URL' in df.columns and 'Website' not in df.columns:
+        df['Website'] = df['URL']
 
-    # Rename Sub-Sector to Subsector for consistency
-    if 'Sub-Sector' in output_df.columns:
-        output_df = output_df.rename(columns={'Sub-Sector': 'Subsector'})
+    required_cols = ['Company Name', 'Website', 'Industry', 'Sector', 'Sub Sector', 'Tier']
+    for col in required_cols:
+        if col not in df.columns:
+            df[col] = None
 
-    # Process each row
-    for index, row in output_df.iterrows():
-        if pd.isna(row['Industry']) or pd.isna(row['Sector']) or pd.isna(row['Subsector']):
-            if pd.isna(row['URL']) or not isinstance(row['URL'], str):
-                print(f"Skipping row {index}: No valid URL provided")
-                continue
+    target_df = df[df['Company Name'].isin(target_companies)]
+    print(f"Found {len(target_df)} target companies to process")
 
-            print(f"Processing {row['URL']}...")
-            website_text = fetch_website_text(row['URL'])
+    if len(target_df) == 0:
+        print("No target companies found in the CSV file. Check company names.")
+        return
 
-            if website_text.startswith("Error"):
-                print(website_text)
-                continue
+    for index, row in target_df.iterrows():
+        if pd.isna(row['Website']) or not urlparse(row['Website']).scheme:
+            print(f"Skipping {row['Company Name']} - Invalid or missing website URL")
+            continue
 
-            result = get_industry_info(website_text)
-            print(result)
+        print(f"\nProcessing {row['Company Name']}: {row['Website']}")
+        processed_data = process_company_data(row)
 
-            if not result.startswith("Error"):
-                lines = result.splitlines()
-                for line in lines:
-                    if "Industry:" in line:
-                        output_df.at[index, 'Industry'] = line.replace("Industry:", "").strip()
-                    elif "Sector:" in line:
-                        output_df.at[index, 'Sector'] = line.replace("Sector:", "").strip()
-                    elif "Subsector:" in line:
-                        output_df.at[index, 'Subsector'] = line.replace("Subsector:", "").strip()
-            time.sleep(3)  # Be polite to OpenAI's API rate limits
+        for col in ['Industry', 'Sector', 'Sub Sector', 'Tier']:
+            csv_col = 'Sub Sector' if col == 'Sub Sector' else col
+            if processed_data[col] and pd.isna(row[csv_col]):
+                print(f"Updating {csv_col} for {row['Company Name']}: {processed_data[col]}")
+                df.at[index, csv_col] = float(processed_data[col]) if processed_data[col] and processed_data[col].isdigit() else processed_data[col]
 
-    # Save to a new file
+        df.to_csv('Intermediate_Results.csv', index=False)
+
+        time.sleep(5)
+
+    print("\nProcessed data for target companies:")
+    print(target_df)
+
     output_path = file_path.replace('.csv', '_processed.csv')
-    output_df.to_csv(output_path, index=False)
-    print(f"\n✅ Updated CSV saved: {output_path}")
+    df.to_csv(output_path, index=False)
+    print(f"\n✅ Processing complete. Saved to {output_path}")
 
 
-# Run the function
-update_csv_with_industry_info("Training.csv")
+def integrate_to_salesforce(csv_file_path):
+    sf_username = os.getenv('SALESFORCE_USERNAME')
+    sf_password = os.getenv('SALESFORCE_PASSWORD')
+    sf_security_token = os.getenv('SALESFORCE_SECURITY_TOKEN')
+
+    sf = Salesforce(username=sf_username, password=sf_password, security_token=sf_security_token)
+
+    with open(csv_file_path, 'r') as file:
+        csv_reader = csv.DictReader(file)
+
+        for row in csv_reader:
+            account_data = {
+                'Name': row['Company Name'],
+                'Industry': row['Industry'],
+                'Website': row['Website'],
+                'Tier__c': row['Tier'],
+                'BillingCity': row['City'],
+                'BillingState': row['State'],
+                'BillingCountry': row['Country']
+            }
+
+            try:
+                result = sf.Account.upsert(f"Website/{account_data['Website']}", account_data)
+                print(f"Upserted account: {account_data['Name']}")
+            except Exception as e:
+                print(f"Error upserting account {account_data['Name']}: {str(e)}")
+
+if __name__ == '__main__':
+    target_companies = [
+        "Boyette Electric Inc",
+        "GREATMARK INVESTMENT PARTNERS INC",
+        "G-Force Manufacturing"
+    ]
+    update_csv_with_industry_info("Testing.csv", target_companies)

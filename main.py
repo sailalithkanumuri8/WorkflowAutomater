@@ -4,10 +4,10 @@ import requests
 from bs4 import BeautifulSoup
 import time
 from urllib.parse import urlparse
-import csv
-from simple_salesforce import Salesforce
 import os
 from dotenv import load_dotenv
+from SourceScrubScript import get_sourcescrub_data_as_csv
+from SalesForceUploadScript import integrate_to_salesforce
 
 load_dotenv()
 openai.api_key = os.getenv('OPEN_AI_API_KEY')
@@ -107,7 +107,7 @@ def process_company_data(row):
             }
             tier = determine_investment_tier(industry_data, website_text)
             print(f"Tier response: {tier}")
-            result['Tier'] = tier if tier in {'1', '2', '3'} else '3'  # Default to 3 on errors
+            result['Tier'] = tier if tier in {'1', '2', '3'} else '3'
 
     except Exception as e:
         print(f"Processing error for {row['Website']}: {str(e)}")
@@ -168,38 +168,12 @@ def update_csv_with_industry_info(file_path, target_companies):
     df.to_csv(output_path, index=False)
     print(f"\n✅ Processing complete. Saved to {output_path}")
 
-
-def integrate_to_salesforce(csv_file_path):
-    sf_username = os.getenv('SALESFORCE_USERNAME')
-    sf_password = os.getenv('SALESFORCE_PASSWORD')
-    sf_security_token = os.getenv('SALESFORCE_SECURITY_TOKEN')
-
-    sf = Salesforce(username=sf_username, password=sf_password, security_token=sf_security_token)
-
-    with open(csv_file_path, 'r') as file:
-        csv_reader = csv.DictReader(file)
-
-        for row in csv_reader:
-            account_data = {
-                'Name': row['Company Name'],
-                'Industry': row['Industry'],
-                'Website': row['Website'],
-                'Tier__c': row['Tier'],
-                'BillingCity': row['City'],
-                'BillingState': row['State'],
-                'BillingCountry': row['Country']
-            }
-
-            try:
-                result = sf.Account.upsert(f"Website/{account_data['Website']}", account_data)
-                print(f"Upserted account: {account_data['Name']}")
-            except Exception as e:
-                print(f"Error upserting account {account_data['Name']}: {str(e)}")
-
 if __name__ == '__main__':
+    # get_sourcescrub_data_as_csv()
     target_companies = [
         "Boyette Electric Inc",
         "GREATMARK INVESTMENT PARTNERS INC",
         "G-Force Manufacturing"
     ]
     update_csv_with_industry_info("Testing.csv", target_companies)
+    # integrate_to_salesforce("Intermediate_Results.csv")
